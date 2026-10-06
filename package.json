@@ -1,0 +1,9 @@
+{
+  "name": "opencode-agent-guard",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "plugin.ts",
+  "scripts": {
+    "test": "node --test plugin.test.ts"
+  }
+}
