@@ -82,12 +82,22 @@ export function violationMessage(model: string): string {
   ].join("\n")
 }
 
+/** Best-effort project attribution, so a shared log is not ambiguous. */
+export function projectLabel(input: any): string {
+  const dir = input?.directory ?? input?.cwd ?? input?.projectDir ?? process.cwd()
+  return dir.split("/").filter(Boolean).pop() ?? dir
+}
+
 /**
  * Append one JSONL record. Never throws — logging must not break a session —
  * but a failure is surfaced on stderr rather than swallowed, because a guard
  * whose own logging is silently broken cannot report that it is not enforcing.
+ *
+ * `project` and `session` are included because the log is per-machine, not
+ * per-project: without them a violation from one repo is indistinguishable from
+ * a violation in another, which is worse than no log.
  */
-export function recordViolation(entry: { model: string; tool: string }): void {
+export function recordViolation(entry: { model: string; tool: string; project?: string; session?: string }): void {
   try {
     mkdirSync(stateDir(), { recursive: true })
     appendFileSync(violationsLog(), `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`)
@@ -148,7 +158,12 @@ export const server = async () => ({
     const model = findModelViolation(input?.tool ?? input?.toolName, input?.args ?? input?.toolInput ?? input)
     if (model === null) return
     const tool = String(input?.tool ?? input?.toolName ?? "subagent")
-    recordViolation({ model, tool })
+    recordViolation({
+      model,
+      tool,
+      project: projectLabel(input),
+      session: typeof input?.sessionID === "string" ? input.sessionID : undefined,
+    })
     throw new Error(violationMessage(model))
   },
 
@@ -160,9 +175,14 @@ export const server = async () => ({
     const since = new Date(Date.now() - 1000 * 60 * 60 * 24 * 30).toISOString()
     const violations = readViolationsSince(since)
     if (violations.length > 0) {
+      const here = violations.filter((v) => v.project === projectLabel(input))
+      const elsewhere = violations.length - here.length
       console.warn(
-        `[agent-guard] ${violations.length} subagent model override(s) recorded in the last 30 days ` +
-          `(latest: ${violations[violations.length - 1].model}). ` +
+        `[agent-guard] ${violations.length} subagent model override(s) in the last 30 days ` +
+          `(${here.length} in ${projectLabel(input)}` +
+          (elsewhere > 0 ? `, ${elsewhere} in other projects` : "") +
+          `). Latest: ${violations[violations.length - 1].model} ` +
+          `in ${violations[violations.length - 1].project ?? "unknown"}. ` +
           `If these were NOT blocked, the guard is not enforcing — see ${violationsLog()}.`,
       )
     }

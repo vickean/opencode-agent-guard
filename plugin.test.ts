@@ -10,6 +10,7 @@ import {
   readViolationsSince,
   recordViolation,
   patchScriptsIn,
+  projectLabel,
   stateDir,
   violationsLog,
   SUBAGENT_TOOLS,
@@ -83,7 +84,7 @@ test("recordViolation actually writes a readable line", () => {
   // that it is not enforcing only by never saying anything — which is the
   // exact failure mode this plugin exists to prevent.
   withHome((home) => {
-    recordViolation({ model: "expensive/big", tool: "subagent" })
+    recordViolation({ model: "expensive/big", tool: "subagent", project: "ocr-cat" })
     assert.ok(existsSync(violationsLog()), "violations.log must exist after a record")
     const rows = readViolationsSince(new Date(Date.now() - 60_000).toISOString())
     assert.equal(rows.length, 1)
@@ -92,6 +93,25 @@ test("recordViolation actually writes a readable line", () => {
     assert.ok(rows[0].at)
     assert.ok(violationsLog().startsWith(home), "log must live under the current HOME")
   })
+})
+
+test("violations carry project attribution, because the log is per-machine not per-repo", () => {
+  // On a shared machine one repo's violation must be distinguishable from
+  // another's, or the session-start warning reports an unattributable count.
+  withHome(() => {
+    recordViolation({ model: "p/m", tool: "subagent", project: "ocr-cat" })
+    recordViolation({ model: "q/n", tool: "subagent", project: "foresight-accounting" })
+    const rows = readViolationsSince(new Date(Date.now() - 60_000).toISOString())
+    assert.equal(rows.length, 2)
+    assert.deepEqual(rows.map((r) => r.project).sort(), ["foresight-accounting", "ocr-cat"])
+  })
+})
+
+test("projectLabel derives a short repo label and tolerates a missing dir", () => {
+  assert.equal(projectLabel({ directory: "/a/b/ocr-cat" }), "ocr-cat")
+  assert.equal(projectLabel({ cwd: "/x/y/foresight-accounting" }), "foresight-accounting")
+  assert.ok(typeof projectLabel({}) === "string")
+  assert.ok(projectLabel({}).length > 0)
 })
 
 test("readViolationsSince filters by timestamp and skips torn lines", () => {

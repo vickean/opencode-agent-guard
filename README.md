@@ -69,10 +69,31 @@ To test enforcement after installing, deliberately dispatch a subagent with a
 One JSON object per line:
 
 ```json
-{"at":"2026-10-07T05:20:00.000Z","model":"provider/model","tool":"subagent"}
+{"at":"2026-10-07T05:20:00.000Z","model":"provider/model","tool":"subagent","project":"ocr-cat","session":"ses_abc"}
+```
+
+`project` is carried because the log is **per-machine, not per-project** — on a
+shared machine, a violation in one repo has to be distinguishable from a violation
+in another, or the session-start warning reports an unattributable count. The
+warning splits the count accordingly:
+
+```
+[agent-guard] 5 subagent model override(s) in the last 30 days (2 in ocr-cat,
+3 in other projects). Latest: provider/model in foresight-accounting. ...
 ```
 
 Torn lines are skipped rather than failing a session.
+
+## Scope
+
+The guard is **global**: every project on the machine is covered, because the
+operator's model pin is global config and the override risk is global. Guard 2
+(patch re-apply) is inert outside projects that actually have `scripts/patches/`.
+
+Expect this to affect other agents on the same machine, including ones mid-run.
+An agent following a skill that says "always specify the model explicitly" will be
+blocked and will re-dispatch on the configured model instead — which is the
+intended correction, but it is still a behaviour change for that session.
 
 ## Tests
 
@@ -80,9 +101,9 @@ Torn lines are skipped rather than failing a session.
 npm test
 ```
 
-13 tests, `node --test`, no dependencies. Covers the violation detector (present,
-null, blank, wrong-tool, malformed input), the log write path, timestamp
-filtering, torn-line tolerance, and patch-script discovery.
+15 tests, `node --test`, no dependencies. Covers the violation detector (present,
+null, blank, wrong-tool, malformed input), the log write path, project
+attribution, timestamp filtering, torn-line tolerance, and patch-script discovery.
 
 ## Files
 
