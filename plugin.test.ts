@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync, existsSy
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import {
+import plugin, {
   findModelViolation,
   violationMessage,
   readViolationsSince,
@@ -14,6 +14,10 @@ import {
   stateDir,
   violationsLog,
   SUBAGENT_TOOLS,
+  setup,
+  guardToolExecution,
+  sessionDirectory,
+  runSessionStartTasks,
 } from "./plugin.ts"
 
 /** Point HOME at a temp dir for the duration of fn, so state writes are isolated. */
@@ -157,5 +161,148 @@ test("stateDir and violationsLog are derived from the live HOME", () => {
   withHome((home) => {
     assert.equal(stateDir(), `${home}/.local/state/opencode-agent-guard`)
     assert.equal(violationsLog(), `${home}/.local/state/opencode-agent-guard/violations.log`)
+  })
+})
+
+// --- V2 (OpenCode 2) wiring -------------------------------------------------
+//
+// The reason this plugin once failed to load: it only exported the V1
+// `{ id, server }` shape. OpenCode 2 accepts `{ id, effect }` or `{ id, setup }`
+// and rejects anything else. These tests lock the contract and the hook wiring.
+
+/** Async twin of withHome, because setup() is async. */
+async function withHomeAsync(fn: (home: string) => Promise<void>): Promise<void> {
+  const prev = process.env.HOME
+  const home = mkdtempSync(join(tmpdir(), "agent-guard-"))
+  process.env.HOME = home
+  try {
+    await fn(home)
+  } finally {
+    process.env.HOME = prev
+    rmSync(home, { recursive: true, force: true })
+  }
+}
+
+/** A fake V2 plugin context that records what setup() registers. */
+function fakeV2Context(directory: string) {
+  const toolHooks: Record<string, (event: any) => void> = {}
+  const subscriptions: Array<{ signal: AbortSignal }> = []
+  return {
+    toolHooks,
+    subscriptions,
+    ctx: {
+      location: { directory },
+      tool: {
+        hook: async (name: string, callback: (event: any) => void) => {
+          toolHooks[name] = callback
+        },
+      },
+      event: {
+        // Empty stream: the background loop ends immediately, no timing needed.
+        subscribe: (options: { signal: AbortSignal }) => {
+          subscriptions.push(options)
+          return (async function* () {})()
+        },
+      },
+    },
+  }
+}
+
+test("default export satisfies the V2 loader contract (id + setup), keeping V1", () => {
+  assert.equal(plugin.id, "opencode-agent-guard")
+  assert.equal(typeof plugin.setup, "function", "V2 requires setup or effect")
+  assert.equal(typeof plugin.server, "function", "V1 server() is kept for compatibility")
+})
+
+test("setup returns a cleanup function for a V2 context and is a no-op for V1", async () => {
+  assert.equal(await setup({}), undefined, "a V1-shaped context must not be touched")
+  assert.equal(
+    await setup({ project: {}, directory: "/x", client: {} }),
+    undefined,
+    "a V1 PluginInput has no tool/event domains",
+  )
+
+  const { ctx, subscriptions } = fakeV2Context("/a/b/ocr-cat")
+  const cleanup = await setup(ctx)
+  assert.equal(typeof cleanup, "function")
+  assert.equal(subscriptions.length, 1, "one session-event subscription")
+  assert.equal(subscriptions[0].signal.aborted, false)
+  cleanup?.()
+  assert.equal(subscriptions[0].signal.aborted, true, "cleanup must abort the stream")
+})
+
+test("V2 tool hook refuses a subagent carrying a model and records the violation", async () => {
+  await withHomeAsync(async () => {
+    const { ctx, toolHooks } = fakeV2Context("/a/b/ocr-cat")
+    await setup(ctx)
+    const before = toolHooks["execute.before"]
+    assert.equal(typeof before, "function")
+
+    assert.throws(
+      () => before({ tool: "subagent", input: { agent: "general", model: "expensive/big" }, sessionID: "ses_x" }),
+      /Blocked: subagent dispatch carried an explicit model \(expensive\/big\)/,
+    )
+
+    const rows = readViolationsSince(new Date(Date.now() - 60_000).toISOString())
+    assert.equal(rows.length, 1)
+    assert.equal(rows[0].model, "expensive/big")
+    assert.equal(rows[0].tool, "subagent")
+    assert.equal(rows[0].project, "ocr-cat", "project comes from ctx.location.directory")
+  })
+})
+
+test("V2 tool hook allows a clean dispatch", async () => {
+  await withHomeAsync(async () => {
+    const { ctx, toolHooks } = fakeV2Context("/a/b/ocr-cat")
+    await setup(ctx)
+    assert.doesNotThrow(() => toolHooks["execute.before"]({ tool: "subagent", input: { agent: "general" } }))
+    assert.deepEqual(readViolationsSince(new Date(Date.now() - 60_000).toISOString()), [])
+  })
+})
+
+test("guardToolExecution tolerates malformed V2 events rather than throwing", () => {
+  withHome(() => {
+    assert.doesNotThrow(() => guardToolExecution(undefined, "p"))
+    assert.doesNotThrow(() => guardToolExecution({ tool: "read", input: { model: "p/m" } }))
+    assert.doesNotThrow(() => guardToolExecution({ tool: "subagent", input: null }))
+  })
+})
+
+test("sessionDirectory reads a V2 session.created event, ignoring other events", () => {
+  assert.equal(
+    sessionDirectory({ type: "session.created", properties: { info: { directory: "/x/y" } } }),
+    "/x/y",
+  )
+  assert.equal(sessionDirectory({ type: "session.idle", properties: { sessionID: "s" } }), undefined)
+  assert.equal(
+    sessionDirectory({ type: "session.created", properties: { info: {} } }, "/fallback"),
+    "/fallback",
+  )
+  assert.equal(sessionDirectory({ type: "session.created", properties: { info: {} } }), undefined)
+  assert.equal(sessionDirectory(undefined, ""), undefined)
+})
+
+test("runSessionStartTasks reports prior violations and runs project patch scripts", () => {
+  withHome((home) => {
+    recordViolation({ model: "p/m", tool: "subagent", project: "ocr-cat" })
+    const patchDir = join(home, "scripts", "patches")
+    mkdirSync(patchDir, { recursive: true })
+    writeFileSync(join(patchDir, "fix.sh"), "#!/usr/bin/env bash\necho 'status: patched'\n", { mode: 0o755 })
+
+    const warns: string[] = []
+    const logs: string[] = []
+    const origWarn = console.warn
+    const origLog = console.log
+    console.warn = (...args: unknown[]) => warns.push(args.join(" "))
+    console.log = (...args: unknown[]) => logs.push(args.join(" "))
+    try {
+      runSessionStartTasks(home)
+    } finally {
+      console.warn = origWarn
+      console.log = origLog
+    }
+
+    assert.ok(warns.some((w) => w.includes("1 subagent model override")))
+    assert.ok(logs.some((l) => l.includes("fix.sh: status: patched")))
   })
 })

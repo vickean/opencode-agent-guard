@@ -29,11 +29,11 @@ re-applies the SDD model-selection patch after each `superpowers` update.
 
 ## Install
 
-Add to `~/.config/opencode/opencode.json`:
+Add to `~/.config/opencode/opencode.json` (OpenCode 2 uses the `plugins` key):
 
 ```json
 {
-  "plugin": [
+  "plugins": [
     "opencode-agent-guard@git+https://github.com/vickean/opencode-agent-guard.git"
   ]
 }
@@ -41,16 +41,20 @@ Add to `~/.config/opencode/opencode.json`:
 
 Restart OpenCode. There is nothing else to configure.
 
-## The honest limit
+The default export carries both entrypoints: `id` + `setup()` for OpenCode 2
+and `server()` for OpenCode 1 (>= 1.18.29). OpenCode 2 reads `setup()` and
+ignores `server()`.
 
-The block is implemented by throwing from a `tool.execute.before` hook. **Whether
-OpenCode surfaces a thrown hook error as a blocking failure, or swallows it, is
-not verified** — that needs an installed plugin and a restart to observe, and the
-plugin API ships no type definitions at the paths checked while building it.
+## How the block works
 
-So the plugin does not rely on the block alone. Every violation is appended to
-`~/.local/state/opencode-agent-guard/violations.log`, and `session.created` reads
-that log back and warns about violations in the last 30 days:
+The block is implemented by throwing from the `execute.before` tool hook —
+`ctx.tool.hook("execute.before", …)` in OpenCode 2, the V1 `tool.execute.before`
+hook for older releases. Throwing is what refuses the dispatch.
+
+The guard does not rely on the throw alone. Every violation is appended to
+`~/.local/state/opencode-agent-guard/violations.log` **before** it throws, and the
+`session.created` handler reads that log back and warns about violations in the
+last 30 days:
 
 ```
 [agent-guard] 3 subagent model override(s) recorded in the last 30 days
@@ -101,9 +105,10 @@ intended correction, but it is still a behaviour change for that session.
 npm test
 ```
 
-15 tests, `node --test`, no dependencies. Covers the violation detector (present,
+22 tests, `node --test`, no dependencies. Covers the violation detector (present,
 null, blank, wrong-tool, malformed input), the log write path, project
-attribution, timestamp filtering, torn-line tolerance, and patch-script discovery.
+attribution, timestamp filtering, torn-line tolerance, patch-script discovery,
+and the OpenCode 2 wiring (default export contract, tool hook, session event).
 
 ## Files
 
